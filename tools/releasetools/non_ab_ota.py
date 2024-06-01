@@ -23,6 +23,7 @@ import verity_utils
 from check_target_files_vintf import CheckVintfIfTrebleEnabled, HasPartition
 from common import OPTIONS
 from ota_utils import UNZIP_PATTERN, FinalizeMetadata, GetPackageMetadata, PropertyFiles
+import subprocess
 
 logger = logging.getLogger(__name__)
 
@@ -40,28 +41,20 @@ def GetBlockDifferences(target_zip, source_zip, target_info, source_info,
                                         info_dict=source_info,
                                         allow_shared_blocks=allow_shared_blocks)
 
-    hashtree_info_generator = verity_utils.CreateHashtreeInfoGenerator(
-        name, 4096, target_info)
     partition_tgt = common.GetUserImage(name, OPTIONS.target_tmp, target_zip,
                                         info_dict=target_info,
-                                        allow_shared_blocks=allow_shared_blocks,
-                                        hashtree_info_generator=hashtree_info_generator)
+                                        allow_shared_blocks=allow_shared_blocks)
 
     # Check the first block of the source system partition for remount R/W only
     # if the filesystem is ext4.
     partition_source_info = source_info["fstab"]["/" + name]
     check_first_block = partition_source_info.fs_type == "ext4"
-    # Disable using imgdiff for squashfs. 'imgdiff -z' expects input files to be
-    # in zip formats. However with squashfs, a) all files are compressed in LZ4;
-    # b) the blocks listed in block map may not contain all the bytes for a
-    # given file (because they're rounded to be 4K-aligned).
-    partition_target_info = target_info["fstab"]["/" + name]
-    disable_imgdiff = (partition_source_info.fs_type == "squashfs" or
-                       partition_target_info.fs_type == "squashfs")
+    # Disable imgdiff because it relies on zlib to produce stable output
+    # across different versions, which is often not the case.
     return common.BlockDifference(name, partition_tgt, partition_src,
                                   check_first_block,
                                   version=blockimgdiff_version,
-                                  disable_imgdiff=disable_imgdiff)
+                                  disable_imgdiff=True)
 
   if source_zip:
     # See notes in common.GetUserImage()
@@ -315,7 +308,8 @@ endif;
   needed_property_files = (
       NonAbOtaPropertyFiles(),
   )
-  FinalizeMetadata(metadata, staging_file, output_file, needed_property_files)
+  FinalizeMetadata(metadata, staging_file, output_file,
+                   needed_property_files, package_key=OPTIONS.package_key)
 
 
 def WriteBlockIncrementalOTAPackage(target_zip, source_zip, output_file):
@@ -442,7 +436,7 @@ else if get_stage("%(bcb_dev)s") != "3/3" then
   if updating_boot:
     boot_type, boot_device_expr = common.GetTypeAndDeviceExpr("/boot",
                                                               source_info)
-    d = common.Difference(target_boot, source_boot)
+    d = common.Difference(target_boot, source_boot, "bsdiff")
     _, _, d = d.ComputePatch()
     if d is None:
       include_full_boot = True
@@ -570,7 +564,8 @@ endif;
   needed_property_files = (
       NonAbOtaPropertyFiles(),
   )
-  FinalizeMetadata(metadata, staging_file, output_file, needed_property_files)
+  FinalizeMetadata(metadata, staging_file, output_file,
+                   needed_property_files, package_key=OPTIONS.package_key)
 
 
 def GenerateNonAbOtaPackage(target_file, output_file, source_file=None):
@@ -593,8 +588,18 @@ def GenerateNonAbOtaPackage(target_file, output_file, source_file=None):
   if OPTIONS.extracted_input is not None:
     OPTIONS.input_tmp = OPTIONS.extracted_input
   else:
-    logger.info("unzipping target target-files...")
-    OPTIONS.input_tmp = common.UnzipTemp(target_file, UNZIP_PATTERN)
+    if not os.path.isdir(target_file):
+      logger.info("unzipping target target-files...")
+      OPTIONS.input_tmp = common.UnzipTemp(target_file, UNZIP_PATTERN)
+    else:
+      OPTIONS.input_tmp = target_file
+      tmpfile = common.MakeTempFile(suffix=".zip")
+      os.unlink(tmpfile)
+      common.RunAndCheckOutput(
+          ["zip", tmpfile, "-r", ".", "-0"], cwd=target_file)
+      assert zipfile.is_zipfile(tmpfile)
+      target_file = tmpfile
+
   OPTIONS.target_tmp = OPTIONS.input_tmp
 
   # If the caller explicitly specified the device-specific extensions path via
